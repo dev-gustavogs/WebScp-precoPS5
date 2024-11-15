@@ -134,7 +134,7 @@ async def main():
             print("Dados salvos no banco:", product_info)
             
             # Aguarda 10 segundos antes da próxima execução
-            await asyncio.sleep(10)
+            await asyncio.sleep(100)
 
     except KeyboardInterrupt:
         print("Parando a execução...")
