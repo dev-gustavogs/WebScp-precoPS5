@@ -2,8 +2,33 @@ import requests
 from bs4 import BeautifulSoup
 import time
 import pandas as pd
+import asyncio
+from telegram import Bot
+import os
+from dotenv import load_dotenv
+import psycopg2
+from sqlalchemy import create_engine
 
-def fecht_page():
+load_dotenv()
+
+# Configurações do bot do Telegram
+TOKEN = os.getenv('TELEGRAM_TOKEN')
+CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+bot = Bot(token=TOKEN)
+
+# Configurações do banco de dados PostgreSQL
+POSTGRES_DB = os.getenv("POSTGRES_DB")
+POSTGRES_USER = os.getenv("POSTGRES_USER")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD")
+POSTGRES_HOST = os.getenv("POSTGRES_HOST")
+POSTGRES_PORT = os.getenv("POSTGRES_PORT")
+
+# Cria o engine do SQLAlchemy para o PostgreSQL
+DATABASE_URL = f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
+engine = create_engine(DATABASE_URL)
+
+
+def fetch_page():
   url = "https://www.mercadolivre.com.br/console-playstation-5-digital-slim-branco-1tb-returnal-e-ratchet-e-clank-controle-sem-fio-dualsense-branco/p/MLB37494438#polycard_client=search-nordic&wid=MLB3885192251&sid=search&searchVariation=MLB37494438&position=1&search_layout=grid&type=product&tracking_id=33b3de9b-666c-44cc-9ced-d8d8cc8e11db"
   response = requests.get(url)
   return response.text
@@ -26,18 +51,95 @@ def parser_page(html):
         'timestamp': timestamp
   }
   
-def save_to_dataframe(product_info, df):
-    new_row = pd.DataFrame([product_info])
-    """Salva uma linha de dados no banco de dados SQLite usando pandas."""
-    df = pd.concat([df, new_row], ignore_index=True)
-    return df
+def create_connection():
+    """Cria uma conexão com o banco de dados PostgreSQL."""
+    conn = psycopg2.connect(
+        dbname=POSTGRES_DB,
+        user=POSTGRES_USER,
+        password=POSTGRES_PASSWORD,
+        host=POSTGRES_HOST,
+        port = POSTGRES_PORT
+    )
+    return conn
+  
 
-if __name__ == "__main__":
-  df = pd.DataFrame()
-  while True:
-        page_content = fecht_page()
-        product_info = parser_page(page_content)
-        df = save_to_dataframe(product_info, df)
-        # Exibe o DataFrame atualizado
-        print(df)
-        time.sleep(10)
+def setup_database(conn):
+    """Cria a tabela de preços se ela não existir."""
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS prices (
+            id SERIAL PRIMARY KEY,
+            product_name TEXT,
+            old_price INTEGER,
+            new_price INTEGER,
+            installment_price INTEGER,
+            timestamp TEXT
+        )
+    ''')
+    conn.commit()
+  
+def save_to_database(data, table_name='prices'):
+    """Salva uma linha de dados no banco de dados PostgreSQL usando pandas e SQLAlchemy."""
+    df = pd.DataFrame([data])
+    # Usa SQLAlchemy para salvar os dados no PostgreSQL
+    df.to_sql(table_name, engine, if_exists='append', index=False)
+
+def get_max_price(conn):
+    """Consulta o maior preço registrado até o momento com o timestamp correspondente."""
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT new_price, timestamp 
+        FROM prices 
+        WHERE new_price = (SELECT MAX(new_price) FROM prices);
+    """)
+    result = cursor.fetchone()
+    cursor.close()
+    if result and result[0] is not None:
+        return result[0], result[1]
+    return None, None
+  
+async def send_telegram_message(text):
+    """Envia uma mensagem para o Telegram."""
+    await bot.send_message(chat_id=CHAT_ID, text=text)
+    
+# Função principal
+async def main():
+    conn = create_connection()
+    setup_database(conn)
+
+    try:
+        while True:
+            # Faz a requisição e parseia a página
+            page_content = fetch_page()
+            product_info = parser_page(page_content)
+            current_price = product_info['new_price']
+            
+            # Obtém o maior preço já salvo
+            max_price, max_price_timestamp = get_max_price(conn)
+            
+            # Comparação de preços
+            if max_price is None or current_price > max_price:
+                message = f"Novo preço maior detectado: {current_price}"
+                print(message)
+                await send_telegram_message(message)
+                max_price = current_price
+                max_price_timestamp = product_info['timestamp']
+            else:
+                message = f"O maior preço registrado é {max_price} em {max_price_timestamp}"
+                print(message)
+                await send_telegram_message(message)
+
+            # Salva os dados no banco de dados PostgreSQL
+            save_to_database(product_info)
+            print("Dados salvos no banco:", product_info)
+            
+            # Aguarda 10 segundos antes da próxima execução
+            await asyncio.sleep(10)
+
+    except KeyboardInterrupt:
+        print("Parando a execução...")
+    finally:
+        conn.close()
+
+# Executa o loop assíncrono
+asyncio.run(main())
